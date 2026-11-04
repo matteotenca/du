@@ -11,6 +11,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 // ---------------------------------------------------------------- Win32 FFI
 
@@ -88,6 +89,62 @@ extern "system" {
     fn GetFileInformationByHandleEx(h: Handle, class: i32, out: *mut c_void, size: u32) -> i32;
     fn FileTimeToSystemTime(ft: *const FileTime, st: *mut SystemTime) -> i32;
     fn SystemTimeToTzSpecificLocalTime(tz: *const c_void, utc: *const SystemTime, local: *mut SystemTime) -> i32;
+}
+
+#[repr(C)]
+struct UnicodeString {
+    len: u16,
+    max: u16,
+    buf: *const u16,
+}
+
+#[repr(C)]
+struct ObjAttr {
+    length: u32,
+    root: Handle,
+    name: *const UnicodeString,
+    attrs: u32,
+    sd: *const c_void,
+    sqos: *const c_void,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IoStatus {
+    status: isize,
+    info: usize,
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtCreateFile(
+        h: *mut Handle,
+        access: u32,
+        oa: *const ObjAttr,
+        io: *mut IoStatus,
+        alloc: *const i64,
+        attrs: u32,
+        share: u32,
+        disp: u32,
+        opts: u32,
+        ea: *const c_void,
+        ea_len: u32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn NtQueryDirectoryFile(
+        h: Handle,
+        event: Handle,
+        apc: *const c_void,
+        ctx: *const c_void,
+        io: *mut IoStatus,
+        buf: *mut c_void,
+        len: u32,
+        class: i32,
+        single: u8,
+        name: *const UnicodeString,
+        restart: u8,
+    ) -> i32;
+    fn RtlNtStatusToDosError(status: i32) -> u32;
 }
 
 const ATTR_DIR: u32 = 0x10;
@@ -814,6 +871,297 @@ impl Usage {
 
 type Key = (u32, u64);
 
+fn quote(p: &OsStr) -> String {
+    format!("'{}'", p.to_string_lossy())
+}
+
+fn excluded(excl: &[Vec<char>], path: &OsStr) -> bool {
+    if excl.is_empty() {
+        return false;
+    }
+    let p = norm(&path.to_string_lossy());
+    // a pattern matches the whole path or any trailing run of components
+    let mut starts = vec![0];
+    starts.extend(p.iter().enumerate().filter(|(_, &c)| c == '/').map(|(i, _)| i + 1));
+    excl.iter().any(|pat| starts.iter().any(|&i| fnmatch(pat, &p[i..])))
+}
+
+fn join(sep: &str, dir: &OsStr, name: &OsStr) -> OsString {
+    let mut c = dir.to_os_string();
+    if dir.encode_wide().last().is_none_or(|l| !SEP_CHARS.contains(&l)) {
+        c.push(sep);
+    }
+    c.push(name);
+    c
+}
+
+// NTFS directories have no meaningful byte size (index size only): count 0, as Explorer does.
+// st_blocks is in 512-byte units; tiny NTFS files (resident in the MFT) report an
+// AllocationSize below that, so round up like a POSIX du sees them.
+fn usage_size(apparent: bool, is_dir: bool, eof: u64, alloc: u64) -> u64 {
+    match (apparent, is_dir) {
+        (true, true) => 0,
+        (true, false) => eof,
+        _ => alloc.div_ceil(512) * 512,
+    }
+}
+
+// ---------------------------------------------------------------- scan
+
+// Phase 1 walks the tree in parallel and records it in memory; phase 2 (Du::emit)
+// replays it sequentially in readdir order, so output, hard-link "first wins" and
+// error order match a single-threaded GNU du. Entries come from bulk directory
+// enumeration (size, allocation, times, file id, reparse tag in one syscall per
+// ~thousand entries), so regular files are never opened. Hard links are found by
+// file id: two entries with the same (volume, id) are the same file.
+
+struct Rec {
+    key: Key,
+    size: u64,
+    time: u64,
+    name: OsString,
+}
+
+enum Entry {
+    File(Rec),
+    Dir(OsString, Arc<OnceLock<Node>>),
+}
+
+struct Node {
+    own: Usage,
+    entries: Vec<Entry>,
+    errors: Vec<String>,
+}
+
+struct DirHandle(Handle);
+
+impl Drop for DirHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+struct Task {
+    path: OsString,
+    parent: Option<(Arc<DirHandle>, OsString)>, // open relative to parent: no path length limit
+    slot: Arc<OnceLock<Node>>,
+    own: Usage,
+    vol: u32,
+    anc: Vec<Key>, // ancestor ids, only tracked with -L (cycle detection)
+}
+
+struct Scan<'a> {
+    cfg: &'a Cfg,
+    sep: &'static str,
+    root_vol: u32,
+}
+
+struct Queue {
+    m: Mutex<(Vec<Task>, usize)>, // pending tasks, tasks in flight
+    cv: Condvar,
+}
+
+fn open_dir(t: &Task) -> io::Result<DirHandle> {
+    let mut h: Handle = 0;
+    match &t.parent {
+        Some((parent, name)) => {
+            let w: Vec<u16> = name.encode_wide().collect();
+            let us = UnicodeString { len: (w.len() * 2) as u16, max: (w.len() * 2) as u16, buf: w.as_ptr() };
+            let oa = ObjAttr {
+                length: std::mem::size_of::<ObjAttr>() as u32,
+                root: parent.0,
+                name: &us,
+                attrs: 0,
+                sd: std::ptr::null(),
+                sqos: std::ptr::null(),
+            };
+            let mut io = IoStatus::default();
+            // LIST_DIRECTORY|SYNCHRONIZE; DIRECTORY_FILE|SYNC_IO_NONALERT|OPEN_FOR_BACKUP_INTENT
+            let st = unsafe { NtCreateFile(&mut h, 0x0010_0001, &oa, &mut io, std::ptr::null(), 0, 7, 1, 0x4021, std::ptr::null(), 0) };
+            if st < 0 {
+                return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(st) } as i32));
+            }
+        }
+        None => {
+            let w: Vec<u16> = long_path(Path::new(&t.path)).as_os_str().encode_wide().chain(Some(0)).collect();
+            h = unsafe { CreateFileW(w.as_ptr(), 0x0010_0001, 7, std::ptr::null(), 3, 0x0200_0000, 0) };
+            if h == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(DirHandle(h))
+}
+
+fn scan_dir(sc: &Scan, t: &Task, buf: &mut [u64]) -> (Node, Vec<Task>) {
+    let cfg = sc.cfg;
+    let mut node = Node { own: t.own, entries: Vec::new(), errors: Vec::new() };
+    let mut new = Vec::new();
+    let h = match open_dir(t) {
+        Ok(h) => Arc::new(h),
+        Err(e) => {
+            node.errors.push(format!("cannot read directory {}: {}", quote(&t.path), err_text(&e)));
+            return (node, new);
+        }
+    };
+    if !cfg.apparent {
+        // The allocation cached in the parent's directory entry omits the directory's own
+        // index buffers; the open handle knows the real figure.
+        let mut s = StdInfo::default();
+        if unsafe { GetFileInformationByHandleEx(h.0, 1, &mut s as *mut _ as *mut c_void, 24) } != 0 {
+            node.own.size = usage_size(false, true, 0, s.alloc as u64);
+        }
+    }
+    let (mut class, mut restart, mut first) = (38, 1u8, true); // FileIdFullDirectoryInformation
+    loop {
+        let mut io = IoStatus::default();
+        let st = unsafe {
+            NtQueryDirectoryFile(h.0, 0, std::ptr::null(), std::ptr::null(), &mut io, buf.as_mut_ptr() as *mut c_void, (buf.len() * 8) as u32, class, 0, std::ptr::null(), restart)
+        };
+        restart = 0;
+        let code = st as u32;
+        if code == 0x8000_0006 || code == 0xC000_000F {
+            break; // no more files
+        }
+        if st < 0 {
+            if first && class == 38 && matches!(code, 0xC000_0003 | 0xC000_00BB | 0xC000_000D) {
+                (class, restart) = (2, 1); // filesystem without file ids: FileFullDirectoryInformation
+                continue;
+            }
+            let e = io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(st) } as i32);
+            node.errors.push(format!("cannot read directory {}: {}", quote(&t.path), err_text(&e)));
+            break;
+        }
+        first = false;
+        let base = buf.as_ptr() as *const u8;
+        let mut off = 0usize;
+        loop {
+            let p = unsafe { base.add(off) };
+            let (next, attrs, nlen, ea) = unsafe {
+                (
+                    std::ptr::read_unaligned(p as *const u32),
+                    std::ptr::read_unaligned(p.add(56) as *const u32),
+                    std::ptr::read_unaligned(p.add(60) as *const u32) as usize,
+                    std::ptr::read_unaligned(p.add(64) as *const u32),
+                )
+            };
+            let i64_at = |o: usize| unsafe { std::ptr::read_unaligned(p.add(o) as *const i64) };
+            let (id, name_off) = if class == 38 { (i64_at(72) as u64, 80) } else { (0, 68) };
+            let name = unsafe { std::slice::from_raw_parts(p.add(name_off) as *const u16, nlen / 2) };
+            if name != [b'.' as u16] && name != [b'.' as u16, b'.' as u16] {
+                let time = match cfg.time_kind {
+                    TimeKind::Mtime => i64_at(24),
+                    TimeKind::Atime => i64_at(16),
+                    TimeKind::Ctime => i64_at(32),
+                    TimeKind::Birth => i64_at(8),
+                } as u64;
+                add_entry(sc, t, &h, &mut node, &mut new, name, attrs, ea, id, i64_at(40) as u64, i64_at(48) as u64, time);
+            }
+            if next == 0 {
+                break;
+            }
+            off += next as usize;
+        }
+    }
+    (node, new)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_entry(sc: &Scan, t: &Task, h: &Arc<DirHandle>, node: &mut Node, new: &mut Vec<Task>, name: &[u16], attrs: u32, tag: u32, id: u64, eof: u64, alloc: u64, time: u64) {
+    let cfg = sc.cfg;
+    let is_dir = attrs & ATTR_DIR != 0;
+    let link = attrs & ATTR_REPARSE != 0 && (tag == TAG_SYMLINK || tag == TAG_MOUNT_POINT);
+    let follow = link && cfg.deref;
+    let name_os = OsString::from_wide(name);
+    // Display paths are only built when something needs them.
+    let full = (!cfg.excl.is_empty() || follow || is_dir).then(|| join(sc.sep, &t.path, &name_os));
+    if let Some(f) = &full {
+        if excluded(&cfg.excl, f) {
+            return;
+        }
+    }
+    if follow {
+        let full = full.unwrap();
+        match stat(Path::new(&full), true, cfg.time_kind) {
+            Err(e) => node.errors.push(format!("cannot access {}: {}", quote(&full), err_text(&e))),
+            Ok(fi) if fi.is_dir => {
+                let key = (fi.vol, fi.idx);
+                if t.anc.contains(&key) {
+                    node.errors.push(format!("{}: directory causes a cycle", quote(&full)));
+                } else if !(cfg.one_fs && fi.vol != sc.root_vol) {
+                    let slot = Arc::new(OnceLock::new());
+                    let mut anc = t.anc.clone();
+                    anc.push(key);
+                    node.entries.push(Entry::Dir(name_os, slot.clone()));
+                    let own = Usage { size: usage_size(cfg.apparent, true, fi.size, fi.alloc), inodes: 1, time: fi.time };
+                    new.push(Task { path: full, parent: None, slot, own, vol: fi.vol, anc });
+                }
+            }
+            Ok(fi) => {
+                let size = usage_size(cfg.apparent, false, fi.size, fi.alloc);
+                node.entries.push(Entry::File(Rec { key: (fi.vol, fi.idx), size, time: fi.time, name: name_os }));
+            }
+        }
+    } else if is_dir && !link {
+        let slot = Arc::new(OnceLock::new());
+        let mut anc = Vec::new();
+        if cfg.deref {
+            anc = t.anc.clone();
+            anc.push((t.vol, id));
+        }
+        node.entries.push(Entry::Dir(name_os.clone(), slot.clone()));
+        let own = Usage { size: usage_size(cfg.apparent, true, eof, alloc), inodes: 1, time };
+        new.push(Task { path: full.unwrap(), parent: Some((h.clone(), name_os)), slot, own, vol: t.vol, anc });
+    } else {
+        // regular file, or a link we do not follow (counted as the link itself)
+        let size = usage_size(cfg.apparent, false, eof, alloc);
+        node.entries.push(Entry::File(Rec { key: (t.vol, id), size, time, name: name_os }));
+    }
+}
+
+fn worker(sc: &Scan, q: &Queue) {
+    let mut buf = vec![0u64; 1 << 15]; // 256 KiB, 8-byte aligned
+    loop {
+        let task = {
+            let mut g = q.m.lock().unwrap();
+            loop {
+                if let Some(t) = g.0.pop() {
+                    g.1 += 1;
+                    break Some(t);
+                }
+                if g.1 == 0 {
+                    break None;
+                }
+                g = q.cv.wait(g).unwrap();
+            }
+        };
+        let Some(task) = task else { return };
+        let (node, new) = scan_dir(sc, &task, &mut buf);
+        let _ = task.slot.set(node);
+        let mut g = q.m.lock().unwrap();
+        g.1 -= 1;
+        let wake = !new.is_empty() || g.1 == 0;
+        g.0.extend(new);
+        drop(g);
+        if wake {
+            q.cv.notify_all();
+        }
+    }
+}
+
+fn scan(cfg: &Cfg, sep: &'static str, root_vol: u32, root: Task) {
+    let q = Queue { m: Mutex::new((vec![root], 0)), cv: Condvar::new() };
+    let sc = Scan { cfg, sep, root_vol };
+    let n = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for _ in 0..n {
+            s.spawn(|| worker(&sc, &q));
+        }
+    });
+}
+
+// ---------------------------------------------------------------- du
+
 struct Du {
     cfg: Cfg,
     out: BufWriter<io::Stdout>,
@@ -824,35 +1172,11 @@ struct Du {
     root_vol: u32,
 }
 
-fn quote(p: &OsStr) -> String {
-    format!("'{}'", p.to_string_lossy())
-}
-
 impl Du {
     fn warn(&mut self, msg: String) {
         let _ = self.out.flush();
         eprintln!("du: {}", msg);
         self.status = 1;
-    }
-
-    fn excluded(&self, path: &OsStr) -> bool {
-        if self.cfg.excl.is_empty() {
-            return false;
-        }
-        let p = norm(&path.to_string_lossy());
-        // a pattern matches the whole path or any trailing run of components
-        let mut starts = vec![0];
-        starts.extend(p.iter().enumerate().filter(|(_, &c)| c == '/').map(|(i, _)| i + 1));
-        self.cfg.excl.iter().any(|pat| starts.iter().any(|&i| fnmatch(pat, &p[i..])))
-    }
-
-    fn join(&self, dir: &OsStr, name: &OsStr) -> OsString {
-        let mut c = dir.to_os_string();
-        if dir.encode_wide().last().is_none_or(|l| !SEP_CHARS.contains(&l)) {
-            c.push(self.sep);
-        }
-        c.push(name);
-        c
     }
 
     fn fmt_size(&self, n: u64) -> String {
@@ -879,73 +1203,46 @@ impl Du {
         let _ = self.out.write_all(line.as_bytes());
     }
 
-    fn visit(&mut self, path: &OsString, level: usize, anc: &mut Vec<Key>) -> Usage {
-        let none = Usage::default();
-        if self.excluded(path) {
-            return none;
+    // Replays a scanned directory in readdir order; returns what it adds to its parent.
+    fn emit(&mut self, node: &Node, path: &OsString, level: usize) -> Usage {
+        for e in &node.errors {
+            self.warn(e.clone());
         }
-        let follow = self.cfg.deref || (self.cfg.deref_args && level == 0);
-        let fi = match stat(Path::new(path), follow, self.cfg.time_kind) {
-            Ok(f) => f,
-            Err(e) => {
-                self.warn(format!("cannot access {}: {}", quote(path), err_text(&e)));
-                return none;
-            }
-        };
-        if level == 0 {
-            self.root_vol = fi.vol;
-        } else if self.cfg.one_fs && fi.is_dir && fi.vol != self.root_vol {
-            return none;
-        }
-        let key = (fi.vol, fi.idx);
-        if fi.is_dir {
-            if anc.contains(&key) {
-                self.warn(format!("{}: directory causes a cycle", quote(path)));
-                return none;
-            }
-        } else if fi.links > 1 && !self.cfg.count_links && !self.seen.insert(key) {
-            return none;
-        }
-
-        // st_blocks is in 512-byte units; tiny NTFS files (resident in the MFT) report
-        // an AllocationSize below that, so round up like a POSIX du sees them.
-        let mut u = Usage {
-            // NTFS directories have no meaningful byte size (index size only): count 0, as Explorer does.
-            size: match (self.cfg.apparent, fi.is_dir) {
-                (true, true) => 0,
-                (true, false) => fi.size,
-                _ => fi.alloc.div_ceil(512) * 512,
-            },
-            inodes: 1,
-            time: fi.time,
-        };
-        self.grand.add(u);
-
-        if fi.is_dir {
-            match std::fs::read_dir(path) {
-                Ok(rd) => {
-                    anc.push(key);
-                    for ent in rd {
-                        match ent {
-                            Ok(e) => {
-                                let child = self.join(path, &e.file_name());
-                                let cu = self.visit(&child, level + 1, anc);
-                                u.add(cu);
-                            }
-                            Err(e) => self.warn(format!("cannot read directory {}: {}", quote(path), err_text(&e))),
+        self.grand.add(node.own);
+        let mut u = node.own;
+        for ent in &node.entries {
+            match ent {
+                Entry::File(r) => {
+                    // id 0 = filesystem without file ids: cannot dedupe
+                    if !self.cfg.count_links && r.key.1 != 0 && !self.seen.insert(r.key) {
+                        // Seen before: a hard link only if the file really has several links;
+                        // otherwise one file reached twice (overlapping operands, -L) counts twice, like GNU.
+                        let p = join(self.sep, path, &r.name);
+                        if stat(Path::new(&p), self.cfg.deref, TimeKind::Mtime).is_ok_and(|fi| fi.links > 1) {
+                            continue;
                         }
                     }
-                    anc.pop();
+                    let fu = Usage { size: r.size, inodes: 1, time: r.time };
+                    self.grand.add(fu);
+                    if self.cfg.all && level < self.cfg.max_depth {
+                        let p = join(self.sep, path, &r.name);
+                        self.print(fu, &p);
+                    }
+                    u.add(fu);
                 }
-                Err(e) => self.warn(format!("cannot read directory {}: {}", quote(path), err_text(&e))),
+                Entry::Dir(name, slot) => {
+                    let child = slot.get().expect("directory scanned");
+                    let p = join(self.sep, path, name);
+                    let cu = self.emit(child, &p, level + 1);
+                    u.add(cu);
+                }
             }
         }
-
-        if level == 0 || level <= self.cfg.max_depth && (fi.is_dir || self.cfg.all) {
+        if level <= self.cfg.max_depth {
             self.print(u, path);
         }
-        if self.cfg.separate && fi.is_dir {
-            none
+        if self.cfg.separate && level > 0 {
+            Usage::default()
         } else {
             u
         }
@@ -954,7 +1251,33 @@ impl Du {
     fn run_arg(&mut self, arg: &OsString) {
         let s = arg.to_string_lossy();
         self.sep = if s.contains('/') && !s.contains('\\') { "/" } else { "\\" };
-        self.visit(arg, 0, &mut Vec::new());
+        if excluded(&self.cfg.excl, arg) {
+            return;
+        }
+        let follow = self.cfg.deref || self.cfg.deref_args;
+        let fi = match stat(Path::new(arg), follow, self.cfg.time_kind) {
+            Ok(f) => f,
+            Err(e) => {
+                self.warn(format!("cannot access {}: {}", quote(arg), err_text(&e)));
+                return;
+            }
+        };
+        self.root_vol = fi.vol;
+        let key = (fi.vol, fi.idx);
+        let own = Usage { size: usage_size(self.cfg.apparent, fi.is_dir, fi.size, fi.alloc), inodes: 1, time: fi.time };
+        if !fi.is_dir {
+            if fi.links > 1 && !self.cfg.count_links && !self.seen.insert(key) {
+                return;
+            }
+            self.grand.add(own);
+            self.print(own, arg);
+            return;
+        }
+        let slot = Arc::new(OnceLock::new());
+        let root = Task { path: arg.clone(), parent: None, slot: slot.clone(), own, vol: fi.vol, anc: vec![key] };
+        scan(&self.cfg, self.sep, self.root_vol, root);
+        let node = slot.get().expect("root scanned");
+        self.emit(node, arg, 0);
     }
 }
 

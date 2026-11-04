@@ -99,6 +99,14 @@ Long options can be abbreviated to any unambiguous prefix, and options can follo
 - **Exclude patterns** match case-insensitively, against the whole path or any trailing run of path components. `\` in a pattern is a path separator, not an escape.
 - **Times** use the Windows local time zone; `TZ` is ignored. `%Z` in `--time-style` prints the UTC offset, not the zone name. `ctime` is the NTFS change time and `birth` is the creation time.
 
+## Performance
+
+Directories are read in bulk with `NtQueryDirectoryFile`, which returns size, allocation, times, file id and reparse tag for hundreds of entries per call, so regular files are never opened. Subdirectories are opened relative to their parent (no path-length limit) and scanned by one worker thread per core. The tree is then replayed in order, so output, hard-link handling and error messages are identical to a single-threaded run.
+
+Hard links are detected by file id (two entries with the same volume and id are the same file).
+
+Because sizes and times come from the directory entries, a file that is being written to right now can report slightly stale values, as with `dir`.
+
 ## Differences from GNU du
 
 - Paths are printed as given, without terminal quoting, and `QUOTING_STYLE` is ignored.
