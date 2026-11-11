@@ -1,7 +1,14 @@
 [package]
 name = "du"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
+description = "A fast native Windows port of GNU du, with NTFS-aware disk usage and parallel directory scanning"
+authors = ["Matteo Tenca <matteo.tenca@gmail.com>"]
+readme = "README.md"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/matteotenca/du"
+categories = ["command-line-utilities"]
+license-file = "LICENSE.txt"
 
 [profile.release]
 opt-level = 3

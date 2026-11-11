@@ -6,6 +6,7 @@
 // shortcut: %Z in --time-style prints the UTC offset, not the zone name.
 
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ffi::{c_void, OsStr, OsString};
 use std::io::{self, BufWriter, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -82,7 +83,7 @@ struct BasicInfo {
 }
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn CreateFileW(name: *const u16, access: u32, share: u32, sa: *const c_void, disp: u32, flags: u32, tmpl: Handle) -> Handle;
     fn CloseHandle(h: Handle) -> i32;
     fn GetFileInformationByHandle(h: Handle, out: *mut ByHandleInfo) -> i32;
@@ -116,7 +117,7 @@ struct IoStatus {
 }
 
 #[link(name = "ntdll")]
-extern "system" {
+unsafe extern "system" {
     fn NtCreateFile(
         h: *mut Handle,
         access: u32,
@@ -208,7 +209,7 @@ fn stat(path: &Path, follow: bool, kind: TimeKind) -> io::Result<Info> {
 
 unsafe fn stat_handle(h: Handle, follow: bool, kind: TimeKind) -> io::Result<Info> {
     let mut d = ByHandleInfo::default();
-    if GetFileInformationByHandle(h, &mut d) == 0 {
+    if unsafe { GetFileInformationByHandle(h, &mut d) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let ft = |f: FileTime| (f.hi as u64) << 32 | f.lo as u64;
@@ -217,12 +218,12 @@ unsafe fn stat_handle(h: Handle, follow: bool, kind: TimeKind) -> io::Result<Inf
     let mut link = false;
     if !follow && d.attrs & ATTR_REPARSE != 0 {
         let mut t = TagInfo::default();
-        if GetFileInformationByHandleEx(h, 9, &mut t as *mut _ as *mut c_void, 8) != 0 {
+        if unsafe { GetFileInformationByHandleEx(h, 9, &mut t as *mut _ as *mut c_void, 8) } != 0 {
             link = t.tag == TAG_SYMLINK || t.tag == TAG_MOUNT_POINT;
         }
     }
     let mut s = StdInfo::default();
-    let alloc = if GetFileInformationByHandleEx(h, 1, &mut s as *mut _ as *mut c_void, 24) != 0 {
+    let alloc = if unsafe { GetFileInformationByHandleEx(h, 1, &mut s as *mut _ as *mut c_void, 24) } != 0 {
         s.alloc as u64
     } else {
         size
@@ -233,7 +234,7 @@ unsafe fn stat_handle(h: Handle, follow: bool, kind: TimeKind) -> io::Result<Inf
         TimeKind::Birth => ft(d.creation),
         TimeKind::Ctime => {
             let mut b = BasicInfo::default();
-            if GetFileInformationByHandleEx(h, 0, &mut b as *mut _ as *mut c_void, 40) != 0 {
+            if unsafe { GetFileInformationByHandleEx(h, 0, &mut b as *mut _ as *mut c_void, 40) } != 0 {
                 b.change as u64
             } else {
                 ft(d.write)
@@ -278,6 +279,9 @@ fn parse_size(s: &str) -> Option<(u64, String)> {
     }
     if rest.is_empty() {
         return Some((mult, String::new()));
+    }
+    if rest == "B" {
+        return Some((mult, if digits > 0 { String::new() } else { "B".into() }));
     }
     let letter = rest.chars().next()?.to_ascii_uppercase();
     let exp = "KMGTPEZY".find(letter)? + 1;
@@ -526,6 +530,8 @@ struct Cfg {
     style: Style,
     excl: Vec<Vec<char>>,
     files0: Option<String>,
+    stop_on_error: bool,
+    show_errors: bool,
 }
 
 fn die(msg: &str) -> ! {
@@ -595,6 +601,8 @@ impl Cfg {
             style,
             excl: Vec::new(),
             files0: None,
+            stop_on_error: false,
+            show_errors: false,
         }
     }
 
@@ -673,6 +681,8 @@ impl Cfg {
                 Err(e) => die(&format!("{}: {}", v, err_text(&e))),
             },
             "files0-from" => self.files0 = Some(v.to_string()),
+            "stop-on-error" => self.stop_on_error = true,
+            "show-errors" => self.show_errors = true,
             "time" => {
                 self.show_time = true;
                 self.time_kind = match v {
@@ -718,7 +728,9 @@ const LONGS: &[(&str, u8, &str)] = &[
     ("one-file-system", 0, "x"),
     ("separate-dirs", 0, "S"),
     ("si", 0, "si"),
+    ("stop-on-error", 0, "stop-on-error"),
     ("summarize", 0, "s"),
+    ("show-errors", 0, "show-errors"),
     ("threshold", 1, "t"),
     ("time", 2, "time"),
     ("time-style", 1, "time-style"),
@@ -823,7 +835,10 @@ Mandatory arguments to long options are mandatory for short options too.
   -P, --no-dereference  don't follow any symbolic links (this is the default)
   -S, --separate-dirs   for directories do not include size of subdirectories
       --si              like -h, but use powers of 1000 not 1024
+      --stop-on-error   stop at the first unreadable file or directory
+                          (default: keep going, exit status 0)
   -s, --summarize       display only a total for each argument
+      --show-errors     print error messages to stderr (default: silent)
   -t, --threshold=SIZE  exclude entries smaller than SIZE if positive,
                           or entries greater than SIZE if negative
       --time            show time of the last modification of any file in the
@@ -871,6 +886,27 @@ impl Usage {
 
 type Key = (u32, u64);
 
+// File ids are already well spread: a multiply-xor hasher beats SipHash on millions of lookups.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.write_u64(x as u64);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_u64(n as u64);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
 fn quote(p: &OsStr) -> String {
     format!("'{}'", p.to_string_lossy())
 }
@@ -882,7 +918,7 @@ fn excluded(excl: &[Vec<char>], path: &OsStr) -> bool {
     let p = norm(&path.to_string_lossy());
     // a pattern matches the whole path or any trailing run of components
     let mut starts = vec![0];
-    starts.extend(p.iter().enumerate().filter(|(_, &c)| c == '/').map(|(i, _)| i + 1));
+    starts.extend(p.iter().enumerate().filter(|&(_, &c)| c == '/').map(|(i, _)| i + 1));
     excl.iter().any(|pat| starts.iter().any(|&i| fnmatch(pat, &p[i..])))
 }
 
@@ -1165,9 +1201,10 @@ fn scan(cfg: &Cfg, sep: &'static str, root_vol: u32, root: Task) {
 struct Du {
     cfg: Cfg,
     out: BufWriter<io::Stdout>,
-    seen: HashSet<Key>,
+    seen: HashSet<Key, BuildHasherDefault<IdHasher>>,
     grand: Usage,
     status: i32,
+    recheck: bool, // an already-seen id may be one file reached twice, not a hard link
     sep: &'static str,
     root_vol: u32,
 }
@@ -1175,8 +1212,12 @@ struct Du {
 impl Du {
     fn warn(&mut self, msg: String) {
         let _ = self.out.flush();
-        eprintln!("du: {}", msg);
-        self.status = 1;
+        if self.cfg.show_errors {
+            eprintln!("du: {}", msg);
+        }
+        if self.cfg.stop_on_error {
+            exit(1);
+        }
     }
 
     fn fmt_size(&self, n: u64) -> String {
@@ -1218,7 +1259,8 @@ impl Du {
                         // Seen before: a hard link only if the file really has several links;
                         // otherwise one file reached twice (overlapping operands, -L) counts twice, like GNU.
                         let p = join(self.sep, path, &r.name);
-                        if stat(Path::new(&p), self.cfg.deref, TimeKind::Mtime).is_ok_and(|fi| fi.links > 1) {
+                        // Without -L and with a single operand a repeated id can only be a hard link.
+                        if !self.recheck || stat(Path::new(&p), self.cfg.deref, TimeKind::Mtime).is_ok_and(|fi| fi.links > 1) {
                             continue;
                         }
                     }
@@ -1332,7 +1374,8 @@ fn run() -> i32 {
     let mut du = Du {
         cfg,
         out: BufWriter::with_capacity(1 << 16, io::stdout()),
-        seen: HashSet::new(),
+        seen: HashSet::default(),
+        recheck: false,
         grand: Usage::default(),
         status: 0,
         sep: "\\",
@@ -1348,6 +1391,7 @@ fn run() -> i32 {
         if let Err(e) = r {
             die(&format!("cannot open '{}' for reading: {}", f, err_text(&e)));
         }
+        du.recheck = true;
         let mut names: Vec<&[u8]> = buf.split(|&b| b == 0).collect();
         if names.last().is_some_and(|n| n.is_empty()) {
             names.pop();
@@ -1364,8 +1408,10 @@ fn run() -> i32 {
         if operands.is_empty() {
             operands.push(".".into());
         }
-        for a in operands.into_iter().flat_map(expand) {
-            du.run_arg(&a);
+        let args: Vec<_> = operands.into_iter().flat_map(expand).collect();
+        du.recheck = du.cfg.deref || args.len() > 1;
+        for a in &args {
+            du.run_arg(a);
         }
     }
 
@@ -1417,6 +1463,10 @@ mod tests {
         assert_eq!(parse_size("KiB"), Some((1024, "KiB".into())));
         assert_eq!(parse_size("2KiB"), Some((2048, "".into())));
         assert_eq!(parse_size("512"), Some((512, "".into())));
+        assert_eq!(parse_size("B"), Some((1, "B".into())));
+        assert_eq!(parse_size("3B"), Some((3, "".into())));
+        assert_eq!(parse_size("MiB"), Some((1 << 20, "MiB".into())));
+        assert_eq!(parse_size("2GiB"), Some((2 << 30, "".into())));
         assert_eq!(parse_size("x"), None);
         assert_eq!(parse_size(""), None);
     }
